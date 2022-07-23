@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+import os
+import shutil
+import random
+import argparse
+import signal
+from multiprocessing import Pool
+from subprocess import call
+
+C_END     = '\033[0m'
+C_BOLD    = '\033[1m'
+C_INVERSE = '\033[7m'
+ 
+C_BLACK  = '\033[30m'
+C_RED    = '\033[31m'
+C_GREEN  = '\033[32m'
+C_YELLOW = '\033[33m'
+C_BLUE   = '\033[34m'
+C_PURPLE = '\033[35m'
+C_CYAN   = '\033[36m'
+C_WHITE  = '\033[37m'
+ 
+C_BGBLACK  = '\033[40m'
+C_BGRED    = '\033[41m'
+C_BGGREEN  = '\033[42m'
+C_BGYELLOW = '\033[43m'
+C_BGBLUE   = '\033[44m'
+C_BGPURPLE = '\033[45m'
+C_BGCYAN   = '\033[46m'
+C_BGWHITE  = '\033[47m'
+
+
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+# ref: https://gist.github.com/greenstick/b23e475d2bfdc3a82e34eaa1f6781ee4
+def printProgressBar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█', autosize=False):
+    percent = f'{100 * (iteration / float(total)):.{decimals}f}'
+    styling = f'{prefix} |{fill}| {iteration}/{total} {percent}% {suffix}'
+    if autosize:
+        cols, _ = shutil.get_terminal_size(fallback = (length, 1))
+        length = cols - len(styling)
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{styling.replace(fill, bar)}', end = '\r')
+    if iteration == total:
+        print()
+
+
+def create_job():
+    if os.path.exists(args.create):
+        return f'{C_RED}FAILURE{C_END}: {args.create} job name is already'
+    else:
+        os.mkdir(args.create)
+        os.mkdir(f'{args.create}/result')
+        os.mkdir(f'{args.create}/error')
+        for script in 'prescript', 'localscript', 'remotescript', 'postscript':
+            with open(f'{args.create}/{script}', 'w') as f:
+                f.write('#!/bin/bash\n')
+                if script == 'localscript':
+                    f.write('# $HOST ENV is each host in hostlist\n')
+        with open(f'{args.create}/hostlist', 'w') as f:
+            f.write('')
+        return f'{C_GREEN}SUCCESS{C_END}: {args.create} job create success'
+
+
+def check():
+    for script in 'prescript', 'localscript', 'remotescript', 'postscript', 'hostlist':
+        if not os.path.isfile(f'{args.job}/{script}'):
+            return f'{C_RED}FAILURE{C_END}: {script} no such file'
+    for folder in 'result', 'error':
+        # 파일인지 검증
+        if os.path.isfile(f'{args.job}/{folder}'):
+            return f'{C_RED}FAILURE{C_END}: {folder} is not directory'
+        # 없으면 생성
+        if not os.path.isdir(f'{args.job}/{folder}'):
+            os.mkdir(f'{args.job}/{folder}')
+
+
+def klogin():
+    res = call(['/usr/bin/kinit', args.login])
+    if res != 0:
+        return f'{C_RED}FAILURE{C_END}: {args.login} kerberos login failed'
+
+
+def init():
+    for result_h in os.scandir(f'{args.job}/result'):
+        os.remove(f'{args.job}/result/{result_h.name}')
+    for error_h in os.scandir(f'{args.job}/error'):
+        os.remove(f'{args.job}/error/{error_h.name}')
+
+
+def prescript():
+    print('[PRESCRIPT]')
+    call(['/bin/bash', f'{args.job}/prescript'])
+
+
+def hostlist(args):
+    arg_pair = []
+    with open(f'{args.job}/hostlist', 'r') as f:
+        for host in f.readlines():
+            arg_pair.append((args, host.strip()))
+    if args.shuffle:
+        random.shuffle(arg_pair)
+    print('[HOSTLIST]')
+    noti = f'{C_RED}!!! CHECK HOST NAME !!!{C_END}'
+    print(f'{noti:-^60}')
+    for args, host in arg_pair:
+        print(host)
+    print(f'{noti:-^60}')
+    return arg_pair
+
+
+def runscript(arg_pair):
+    args = arg_pair[0]
+    host = arg_pair[1]
+    os.environ['HOST'] = host
+    rf = open(f'{args.job}/result/{host}', 'a')
+    ef = open(f'{args.job}/error/{host}', 'a')
+    call(['/bin/bash', f'{args.job}/localscript'])
+    with open(f'{args.job}/remotescript', 'r') as f:
+        call([
+            '/usr/bin/ssh',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=10',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'ControlMaster=auto',
+            '-o', 'LogLevel=error',
+            '-l', args.login, host, '/bin/bash', '-s'
+            ], stdin=f, stdout=rf, stderr=ef)
+    rf.close()
+    ef.close()
+    return host
+
+
+def postscript():
+    print('[POSTSCRIPT]')
+    call(['/bin/bash', f'{args.job}/postscript'])
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Process some argument.')
+    parser.add_argument('job', type=str, nargs='?', default='.', help='job name')
+    parser.add_argument('-c', '--create', type=str, help='create job')
+    parser.add_argument('-s', '--shuffle', action='store_true', help='shuffle hostlist')
+    parser.add_argument('-y', '--yes', action='store_true', help='autometic yes')
+    parser.add_argument('-p', '--process', type=int, default=30, help='concurrency number (default: 30)')
+    parser.add_argument('-l', '--login', type=str, default='root', help='ssh login name (default: root)')
+    args = parser.parse_args()
+
+    # job 생성
+    if args.create:
+        res = create_job()
+        raise SystemExit(res)
+
+    # 필수사항 체크
+    res = check()
+    if res:
+        raise SystemExit(res)
+
+    # 초기화
+    init()
+    prescript()
+    arg_pair = hostlist(args)
+    try:
+        if args.yes:
+            print(f'EXECUTE TOTAL: {len(arg_pair)}')
+            answer = 'yes'
+        else:
+            answer = input(f'EXECUTE TOTAL {len(arg_pair)} [y/N]: ').lower().strip()
+        if answer == 'y' or answer == 'yes':
+            if arg_pair:
+                print('[LOCAL/REMOTESCRIPT]')
+                printProgressBar(0, len(arg_pair), prefix='Progress:', suffix='Complete', autosize=True)
+                with Pool(args.process, init_worker) as pool:
+                    for seq, res in enumerate(pool.imap_unordered(runscript, arg_pair, chunksize=1)):
+                        printProgressBar(seq+1, len(arg_pair), prefix='Progress:', suffix='Complete', autosize=True)
+            postscript()
+    except KeyboardInterrupt:
+        print('\nKeyboardInterrupt, terminating workers')
